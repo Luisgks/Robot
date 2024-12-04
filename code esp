@@ -1,0 +1,216 @@
+#include <PID_v1.h>
+ 
+// Pines del motor maestro
+const int motorMasterPWM = 19, motorMasterDir1 = 18, motorMasterDir2 = 5, encMasterA = 36, encMasterB = 39;
+ 
+// Pines del motor esclavo
+const int motorSlavePWM = 15, motorSlaveDir1 = 4, motorSlaveDir2 = 16, encSlaveA = 34, encSlaveB = 35;
+ 
+// Pines del sensor infrarrojo
+const int IR_SENSOR_PIN = 13;
+ 
+// Variables de los encoders
+volatile long encoderMasterCount = 0, encoderSlaveCount = 0;
+const int pulsesPerRevolution = 492;
+ 
+// Variables del PID para el motor maestro
+double setPointMaster = 50, inputMaster = 0, outputMaster = 0;
+double Kp = 0.004, Ki = 10.0, Kd = 0.0002;
+PID pidMaster(&inputMaster, &outputMaster, &setPointMaster, Kp, Ki, Kd, DIRECT);
+ 
+// Variables del PID para el motor esclavo
+double setPointSlave = 50, inputSlave = 0, outputSlave = 0;
+PID pidSlave(&inputSlave, &outputSlave, &setPointSlave, Kp, Ki, Kd, DIRECT);
+ 
+// Variables de tiempo
+unsigned long lastTime = 0;
+const unsigned long samplingTime = 150;
+unsigned long actionStartTime = 0;
+const unsigned long forwardDuration = 2750; // Tiempo para avanzar hacia adelante
+const unsigned long lateralDuration = 4000; // Tiempo para avanzar lateralmente
+ 
+// Variables de control
+bool motorsActive = true;
+ 
+// Máquina de estados para las acciones del robot
+enum RobotState {
+  RUNNING,
+  TURNING_RIGHT_1,
+  MOVING_FORWARD_1,
+  TURNING_LEFT_1,
+  MOVING_FORWARD_2,
+  TURNING_LEFT_2,
+  MOVING_FORWARD_3,
+  TURNING_RIGHT_2
+};
+RobotState currentState = RUNNING;
+ 
+// Variables para giros
+float d_ruedas = 6.8;
+float p_ruedas = 18.7;
+float distancia_por_rueda = (p_ruedas * 3.1416) / 4;
+float c_rueda = d_ruedas * 3.1416;
+const int pulsesToTurn90 = 410; //(distancia_por_rueda / c_rueda) * pulsesPerRevolution;
+long turnStartEncoderCount = 0;
+ 
+// Búfer de entrada serial
+String serialInput = "";
+ 
+void setup() {
+  // Inicializar pines
+  pinMode(motorMasterPWM, OUTPUT);
+  pinMode(motorMasterDir1, OUTPUT);
+  pinMode(motorMasterDir2, OUTPUT);
+  pinMode(encMasterA, INPUT_PULLUP);
+  pinMode(encMasterB, INPUT_PULLUP);
+ 
+  pinMode(motorSlavePWM, OUTPUT);
+  pinMode(motorSlaveDir1, OUTPUT);
+  pinMode(motorSlaveDir2, OUTPUT);
+  pinMode(encSlaveA, INPUT_PULLUP);
+  pinMode(encSlaveB, INPUT_PULLUP);
+ 
+  pinMode(IR_SENSOR_PIN, INPUT);
+ 
+  // Interrupciones de los encoders
+  attachInterrupt(digitalPinToInterrupt(encMasterA), handleEncoderMaster, RISING);
+  attachInterrupt(digitalPinToInterrupt(encSlaveA), handleEncoderSlave, RISING);
+ 
+  // Configuración de los PID
+  pidMaster.SetMode(AUTOMATIC);
+  pidMaster.SetSampleTime(samplingTime);
+  pidMaster.SetOutputLimits(0, 255);
+ 
+  pidSlave.SetMode(AUTOMATIC);
+  pidSlave.SetSampleTime(samplingTime);
+  pidSlave.SetOutputLimits(0, 255);
+ 
+  Serial.begin(115200);
+  Serial.println("Sistema iniciado. Esperando comandos...");
+}
+ 
+void loop() {
+  // Lectura serial para procesar mensajes completos
+  if (Serial.available() > 0) {
+    String data = Serial.readStringUntil('\n');
+    handleSerialCommand(data);
+  }
+ 
+  if (motorsActive) {
+    mainLoop();
+  } else {
+    stopMotors();
+  }
+}
+ 
+void handleSerialCommand(String data) {
+  data.trim();
+  int classIndex = data.indexOf("CLASS:");
+  if (classIndex != -1) {
+    String classValue = data.substring(classIndex + 6);
+    classValue.trim();
+ 
+    if (classValue == "0" || classValue == "2") {
+      Serial.println("Comando recibido: Detener motores.");
+      motorsActive = false;
+      stopMotors();
+    } else if (classValue == "4") {
+      Serial.println("Comando recibido: Reanudar motores.");
+      motorsActive = true;
+    } else {
+      Serial.println("Comando no reconocido: " + classValue);
+    }
+  } else {
+    Serial.println("Formato no válido: " + data);
+  }
+}
+ 
+void mainLoop() {
+  unsigned long currentTime = millis();
+ 
+  // Verificar el sensor infrarrojo
+  if (digitalRead(IR_SENSOR_PIN) == LOW && currentState == RUNNING) {
+    stopMotors();
+    currentState = TURNING_RIGHT_1;
+    turnStartEncoderCount = encoderMasterCount;
+    actionStartTime = currentTime;
+    Serial.println("Objeto detectado. Iniciando maniobra de esquiva.");
+  }
+ 
+  // Máquina de estados
+  switch (currentState) {
+    case RUNNING:
+      runPID();
+      break;
+  }
+}
+ 
+bool turnDegrees(bool turnLeft) {
+  const int targetPulses = pulsesToTurn90;
+  long pulses = abs(encoderMasterCount - turnStartEncoderCount);
+ 
+  if (pulses < targetPulses) {
+    if (turnLeft) {
+      moveMotor(motorMasterPWM, motorMasterDir1, motorMasterDir2, -95);
+      moveMotor(motorSlavePWM, motorSlaveDir1, motorSlaveDir2, 80);
+    } else {
+      moveMotor(motorMasterPWM, motorMasterDir1, motorMasterDir2, 130);
+      moveMotor(motorSlavePWM, motorSlaveDir1, motorSlaveDir2, -120);
+    }
+    return false;
+  } else {
+    stopMotors();
+    return true;
+  }
+}
+ 
+void runPID() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastTime >= samplingTime) {
+    lastTime = currentTime;
+ 
+    // Control PID para el motor maestro
+    inputMaster = (encoderMasterCount * 60000.0) / (pulsesPerRevolution * samplingTime);
+    encoderMasterCount = 0;
+    pidMaster.Compute();
+    moveMotor(motorMasterPWM, motorMasterDir1, motorMasterDir2, outputMaster);
+ 
+    // Control PID para el motor esclavo
+    inputSlave = (encoderSlaveCount * 60000.0) / (pulsesPerRevolution * samplingTime);
+    encoderSlaveCount = 0;
+    pidSlave.Compute();
+    moveMotor(motorSlavePWM, motorSlaveDir1, motorSlaveDir2, outputSlave);
+  }
+}
+ 
+void stopMotors() {
+  analogWrite(motorMasterPWM, 0);
+  analogWrite(motorSlavePWM, 0);
+  digitalWrite(motorMasterDir1, LOW);
+  digitalWrite(motorMasterDir2, LOW);
+  digitalWrite(motorSlaveDir1, LOW);
+  digitalWrite(motorSlaveDir2, LOW);
+}
+ 
+void handleEncoderMaster() {
+  encoderMasterCount++;
+}
+ 
+void handleEncoderSlave() {
+  encoderSlaveCount++;
+}
+ 
+void moveMotor(int pwmPin, int dir1Pin, int dir2Pin, double pwmValue) {
+  if (pwmValue > 0) {
+    digitalWrite(dir1Pin, HIGH);
+    digitalWrite(dir2Pin, LOW);
+  } else if (pwmValue < 0) {
+    digitalWrite(dir1Pin, LOW);
+    digitalWrite(dir2Pin, HIGH);
+    pwmValue = -pwmValue;
+  } else {
+    digitalWrite(dir1Pin, LOW);
+    digitalWrite(dir2Pin, LOW);
+  }
+  analogWrite(pwmPin, constrain(pwmValue, 0, 255));
+}
